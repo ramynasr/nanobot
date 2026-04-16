@@ -65,6 +65,7 @@ class SlackChannel(BaseChannel):
         self._web_client: AsyncWebClient | None = None
         self._socket_client: SocketModeClient | None = None
         self._bot_user_id: str | None = None
+        self._active_threads: set[str] = set()  # thread_ts values where bot was mentioned
         self._target_cache: dict[str, str] = {}
 
     async def start(self) -> None:
@@ -322,12 +323,18 @@ class SlackChannel(BaseChannel):
         if not self._is_allowed(sender_id, chat_id, channel_type):
             return
 
-        if channel_type != "im" and not self._should_respond_in_channel(event_type, text, chat_id):
+        if channel_type != "im" and not self._should_respond_in_channel(event_type, text, chat_id, event):
             return
 
         text = self._strip_bot_mention(text)
 
         thread_ts = event.get("thread_ts")
+
+        # Track threads where bot was mentioned so we follow the conversation
+        if event_type == "app_mention" or (self._bot_user_id and f"<@{self._bot_user_id}>" in (event.get("text") or "")):
+            mention_thread = thread_ts or event.get("ts")
+            if mention_thread:
+                self._active_threads.add(mention_thread)
         if self.config.reply_in_thread and not thread_ts:
             thread_ts = event.get("ts")
         # Add :eyes: reaction to the triggering message (best-effort)
@@ -396,13 +403,20 @@ class SlackChannel(BaseChannel):
             return chat_id in self.config.group_allow_from
         return True
 
-    def _should_respond_in_channel(self, event_type: str, text: str, chat_id: str) -> bool:
+    def _should_respond_in_channel(self, event_type: str, text: str, chat_id: str, event: dict | None = None) -> bool:
         if self.config.group_policy == "open":
             return True
         if self.config.group_policy == "mention":
             if event_type == "app_mention":
                 return True
-            return self._bot_user_id is not None and f"<@{self._bot_user_id}>" in text
+            if self._bot_user_id is not None and f"<@{self._bot_user_id}>" in text:
+                return True
+            # Follow threads where bot was previously mentioned
+            if event:
+                thread_ts = event.get("thread_ts")
+                if thread_ts and thread_ts in self._active_threads:
+                    return True
+            return False
         if self.config.group_policy == "allowlist":
             return chat_id in self.config.group_allow_from
         return False
