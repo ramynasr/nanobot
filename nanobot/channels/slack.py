@@ -2,6 +2,7 @@
 
 import asyncio
 import re
+import time
 from typing import Any
 
 from loguru import logger
@@ -65,7 +66,7 @@ class SlackChannel(BaseChannel):
         self._web_client: AsyncWebClient | None = None
         self._socket_client: SocketModeClient | None = None
         self._bot_user_id: str | None = None
-        self._active_threads: set[str] = set()  # thread_ts values where bot was mentioned
+        self._active_threads: dict[str, float] = {}  # "{channel_id}:{thread_ts}" -> tracked_time
         self._target_cache: dict[str, str] = {}
 
     async def start(self) -> None:
@@ -331,10 +332,12 @@ class SlackChannel(BaseChannel):
         thread_ts = event.get("thread_ts")
 
         # Track threads where bot was mentioned so we follow the conversation
-        if event_type == "app_mention" or (self._bot_user_id and f"<@{self._bot_user_id}>" in (event.get("text") or "")):
+        if event_type == "app_mention":
             mention_thread = thread_ts or event.get("ts")
             if mention_thread:
-                self._active_threads.add(mention_thread)
+                now = time.time()
+                self._active_threads[f"{chat_id}:{mention_thread}"] = now
+                self._active_threads = {k: v for k, v in self._active_threads.items() if now - v <= 86400}
         if self.config.reply_in_thread and not thread_ts:
             thread_ts = event.get("ts")
         # Add :eyes: reaction to the triggering message (best-effort)
@@ -351,11 +354,18 @@ class SlackChannel(BaseChannel):
         # Thread-scoped session key for channel/group messages
         session_key = f"slack:{chat_id}:{thread_ts}" if thread_ts and channel_type != "im" else None
 
+        # Inject Slack context so the agent can use the slack CLI tool
+        context_parts = [f"[slack channel={chat_id}"]
+        if thread_ts:
+            context_parts.append(f" thread={thread_ts}")
+        context_parts.append("]")
+        content_with_context = f"{''.join(context_parts)}\n{text}"
+
         try:
             await self._handle_message(
                 sender_id=sender_id,
                 chat_id=chat_id,
-                content=text,
+                content=content_with_context,
                 metadata={
                     "slack": {
                         "event": event,
@@ -414,7 +424,7 @@ class SlackChannel(BaseChannel):
             # Follow threads where bot was previously mentioned
             if event:
                 thread_ts = event.get("thread_ts")
-                if thread_ts and thread_ts in self._active_threads:
+                if thread_ts and f"{chat_id}:{thread_ts}" in self._active_threads:
                     return True
             return False
         if self.config.group_policy == "allowlist":
